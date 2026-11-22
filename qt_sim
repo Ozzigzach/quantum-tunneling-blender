@@ -1,0 +1,230 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov 22 22:54:50 2026
+
+@author: Zachary
+"""
+import time
+
+import bpy
+import numpy as np
+
+# Simulation parameters
+N_x = 128
+N_y = 128
+x_min, x_max = -50.0, 50.0
+y_min, y_max = -50.0, 50.0
+
+dx = (x_max-x_min) / (N_x-1)
+dy = (y_max-y_min) / (N_y-1)
+
+x = np.linspace(x_min, x_max, N_x)
+y = np.linspace(y_min, y_max, N_y)
+X, Y = np.meshgrid(x, y)
+
+# Physics Parameters
+E = 2.0
+V0 = 5.0
+L_x = 1.0
+hbar = 1.0
+m_e = 1.0
+
+# Potential barrier
+V = np.zeros((N_y, N_x))
+mask_barrier = (X >= 0) & (X <= L_x)
+V[mask_barrier] = V0
+
+# Absorbing boundaries
+absorb_mask = np.ones((N_y, N_x))
+absorb_width = 5
+aggressiveness = 2.0
+for i in range(absorb_width):
+    fade = ((i + 1) / absorb_width) ** aggressiveness
+    absorb_mask[:, i] *= fade
+    absorb_mask[:, N_x - 1 - i] *= fade
+    absorb_mask[i, :] *= fade
+    absorb_mask[N_y - 1 - i] *= fade
+
+# Initial Gaussian wave packet
+x0 = -20.0
+y0 = 0.0
+sigma = 2.0
+k0_x = np.sqrt(2*m_e*E) / hbar
+
+psi = np.exp(-((X - x0)**2 + (Y - y0)**2) / (2 * sigma**2)) * np.exp(
+    1j * k0_x * X
+)
+
+norm = np.sum(np.abs(psi)**2)*dx*dy
+psi = psi/np.sqrt(norm)
+
+# Time Settings
+kx = 2*np.pi*np.fft.fftfreq(N_x, d=dx)
+ky = 2*np.pi*np.fft.fftfreq(N_y, d=dy)
+KX, KY = np.meshgrid(kx, ky)
+
+k_max = np.max(np.sqrt(KX**2 + KY**2))
+dt_stable = 2.0*m_e/(hbar*k_max**2)
+
+T_total = 50.0
+num_steps = 200
+dt = T_total / num_steps
+
+if dt > dt_stable:
+    dt = dt_stable*0.9
+    num_steps = int(T_total/dt)
+    print(f"dt adjusted to {dt:.4e}, steps={num_steps}")
+
+exp_kinetic = np.exp(-1j*hbar*(KX**2 + KY**2)*dt/(2*m_e))
+exp_potential = np.exp(-1j*V*dt/hbar)
+
+# Simulation
+print(f"Simulating {num_steps} frames ...")
+frames_data = []
+t0 = time.time()
+
+for _ in range(num_steps):
+    # Kinetic (FFT space)
+    psi_k = np.fft.fft2(psi)
+    psi_k *= exp_kinetic
+    psi = np.fft.ifft2(psi_k)
+    # Potential (real space)
+    psi *= exp_potential
+    # Absorption
+    psi *= absorb_mask
+
+    frames_data.append(np.abs(psi)**2)
+
+print(f"Simulation done in {time.time()-t0:.2f}s")
+
+
+# Per-frame normalisation (peak set to value 1)
+TARGET_HEIGHT = 10.0  # Blender Z units for every frame's peak
+
+print("Normalising each frame to its own peak...")
+scaled_frames = []
+for idx, frame in enumerate(frames_data):
+    frame_max = np.max(frame)
+    if frame_max > 0:
+        # Normalise so the peak of THIS frame is 1.0
+        normalised = frame / frame_max
+    else:
+        normalised = np.zeros_like(frame)
+    scaled_frames.append(normalised.astype(np.float32))
+
+# Track the actual physics: how much probability was in each region
+print("\nFrame analysis (peak prob, total prob, % of initial):")
+initial_total = np.sum(frames_data[0]) * dx * dy
+for i in range(0, len(frames_data), max(1, len(frames_data) // 10)):
+    frame_max = np.max(frames_data[i])
+    frame_tot = np.sum(frames_data[i]) * dx * dy
+    pct_init = (frame_tot / initial_total) * 100 if initial_total > 0 else 0
+    print(
+        f"  Frame {i+1:3d}: peak={frame_max:.4e}  total={frame_tot:.4e}  ({pct_init:6.2f}% of initial)"
+    )
+
+# Scene cleanup
+def delete_obj(name):
+    if obj := bpy.data.objects.get(name):
+        mesh = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+
+for n in ("Wave_Surface", "Barrier_Block", "Wave_Camera"):
+    delete_obj(n)
+
+scene = bpy.context.scene
+scene.frame_start = 1
+scene.frame_end = num_steps
+scene.render.fps = 30
+
+# Barrier
+bpy.ops.mesh.primitive_cube_add(size=1)
+barrier = bpy.context.active_object
+barrier.name = "Barrier_Block"
+barrier.scale = (L_x, y_max - y_min, V0)
+barrier.location = (L_x/2, 0, V0/2)
+
+mat_b = bpy.data.materials.get("Mat_Barrier") or bpy.data.materials.new("Mat_Barrier")
+mat_b.use_nodes = True
+bsdf = mat_b.node_tree.nodes.get("Principled BSDF")
+if bsdf:
+    bsdf.inputs["Base Color"].default_value = (1.0, 0.25, 0.34, 1.0)
+    bsdf.inputs["Alpha"].default_value = 0.3
+barrier.data.materials.append(mat_b)
+
+# Wave mesh
+total_vertices = N_x * N_y
+mesh_data = bpy.data.meshes.new("Wave_Surface_Mesh")
+
+vertices = [(x[j], y[i], 0.0) for i in range(N_y) for j in range(N_x)]
+
+faces = []
+for i in range(N_y - 1):
+    for j in range(N_x - 1):
+        v1 = i*N_x + j
+        v2 = (i + 1)*N_x + j
+        v3 = (i + 1)*N_x + j + 1
+        v4 = i*N_x + j + 1
+        faces.append((v1, v2, v3, v4))
+
+mesh_data.from_pydata(vertices, [], faces)
+mesh_data.update()
+
+wave_obj = bpy.data.objects.new("Wave_Surface", mesh_data)
+bpy.context.collection.objects.link(wave_obj)
+
+mat_w = bpy.data.materials.get("Wave_Grad") or bpy.data.materials.new("Wave_Grad")
+mat_w.use_nodes = True
+bsdf = mat_w.node_tree.nodes.get("Principled BSDF")
+if bsdf:
+    bsdf.inputs["Base Color"].default_value = (0.1, 0.5, 1.0, 1.0)
+    bsdf.inputs["Alpha"].default_value = 0.85
+wave_obj.data.materials.append(mat_w)
+
+# Camera
+cam_data = bpy.data.cameras.new("Wave_Camera")
+cam_obj = bpy.data.objects.new("Wave_Camera", cam_data)
+bpy.context.collection.objects.link(cam_obj)
+cam_obj.location = (0, -40, 22)
+cam_obj.rotation_euler = (1.2, 0, 0)
+scene.camera = cam_obj
+
+# Bake Animation
+print("Baking animation...")
+t0 = time.time()
+
+static_xy = [(x[j], y[i]) for i in range(N_y) for j in range(N_x)]
+coords_buf = np.empty(total_vertices*3, dtype=np.float32)
+
+for frame_idx in range(num_steps):
+    # Each frame is already normalised so peak = 1.0
+    # Scale to TARGET_HEIGHT before writing to Blender
+    z = scaled_frames[frame_idx].flatten().ravel()*TARGET_HEIGHT
+
+    for k in range(total_vertices):
+        coords_buf[3*k] = static_xy[k][0]
+        coords_buf[3*k + 1] = static_xy[k][1]
+        coords_buf[3*k + 2] = z[k]
+
+    wave_obj.data.vertices.foreach_set("co", coords_buf)
+    wave_obj.data.update()
+
+    for vi in range(total_vertices):
+        wave_obj.data.vertices[vi].keyframe_insert(
+            data_path="co", index=2, frame=frame_idx + 1
+        )
+
+print(f"Baking done in {time.time()-t0:.2f}s")
+
+# Smooth interpolation
+if wave_obj.animation_data and wave_obj.animation_data.action:
+    for fc in wave_obj.animation_data.action.fcurves:
+        for kp in fc.keyframe_points:
+            kp.interpolation = "CUBIC"
+            kp.handle_left_type = "AUTO"
+            kp.handle_right_type = "AUTO"
+
+print("Animation ready!")
